@@ -1,0 +1,12 @@
+{
+    "name": "exitable/cakephp-data-copy-plugin",
+    "require": {
+        "cakephp/cakephp": "2.5.4"
+    },
+    "authors": [
+        {
+            "name": "Marlin Cremers",
+            "email": "marlin@exitable.nl"
+        }
+    ]
+}
