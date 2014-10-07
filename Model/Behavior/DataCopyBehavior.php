@@ -1,5 +1,8 @@
 <?php
 
+App::uses('DataCopyDebug', 'DataCopy.Lib');
+App::uses('DebugTimer', 'DebugKit.Lib');
+
 class DataCopyBehavior extends ModelBehavior {
 
 	public function setup(Model $Model, $config = array()) {
@@ -16,7 +19,10 @@ class DataCopyBehavior extends ModelBehavior {
 
 	public function beforeFind(Model $Model, $query) {
 		if (!isset($query['copy'])) {
-			$query['copy'] = true;
+			$query['copy'] = null;
+		}
+		if (is_array($query['fields'])) {
+			$query['fields'][] = $Model->alias . '.data_copy_modified';
 		}
 
 		$Model->query = $query;
@@ -25,45 +31,62 @@ class DataCopyBehavior extends ModelBehavior {
 	}
 
 	public function afterFind(Model $Model, $results, $primary = false) {
-		$query = $Model->query;
-
-		$newestData = null;
-		foreach ($results as $result) {
-			foreach ($result as $association => $data) {
-				if (!isset($data['data_copy_modified'])) {
-					continue;
-				}
-				if (($newestData === null) || (strtotime($data['data_copy_modified']) > $newestData)) {
-					$newestData = strtotime($data['data_copy_modified']);
-				}
-			}
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::start(
+				'data-copy-after-find',
+				__d('data_copy', 'DataCopy: Running after find on %1$s with origin %2$s', $Model->alias, $Model->OriginModel->alias)
+			);
 		}
 
-		foreach ($results as $index => $result) {
-			foreach ($result as $association => $data) {
-				foreach ($data as $field => $value) {
-					$unserializedValue = @unserialize($value);
-					if ($unserializedValue === false) {
-						continue;
-					}
-					$results[$index][$association][$field] = $unserializedValue;
-				}
+		$query = $Model->query;
+
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::start(
+				'data-copy-list-old',
+				__d('data_copy', 'DataCopy: Checking for old data from %1$s', $Model->alias)
+			);
+		}
+		$oldestItems = array_map('strtotime', array_values($Model->find('list', array(
+			'fields' => array(
+				$Model->alias . '.' . $Model->primaryKey,
+				$Model->alias . '.data_copy_modified',
+			),
+			'order' => array(
+				$Model->alias . '.data_copy_modified' => 'ASC',
+			),
+			'limit' => 10,
+			'copy' => true,
+			'callbacks' => false
+		))));
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::stop('data-copy-list-old');
+		}
+		$oldestData = null;
+		foreach ($oldestItems as $oldestItemInArray) {
+			if ($oldestItemInArray < $oldestData) {
+				$oldestData = $oldestItemInArray;
 			}
 		}
 
 		if ($query['copy'] === false) {
+			DataCopyDebug::logExpiredLookup($Model, $Model->OriginModel, $query, __d('data_copy', 'Force update'));
+
 			$results = false;
 		}
 
-		if (($newestData !== null) && (time() - $newestData > $this->settings[$Model->alias]['expire'])) {
+		if (($query['copy'] === null) && ($oldestData !== null) && (time() - $oldestData > $this->settings[$Model->alias]['expire'])) {
+			DataCopyDebug::logExpiredLookup($Model, $Model->OriginModel, $query, __d('data_copy', 'Regular expire. Oldest data: %1$s', date('r', $oldestData)));
+
 			$results = false;
 		}
 
-		if (($newestData !== null) && (time() - $newestData > 60)) {
-			$results = false;
-		}
+		if (is_array($results)) {
+			DataCopyDebug::logLookup($Model, $Model->OriginModel, $query);
 
-		if ($results) {
+			if (CakePlugin::loaded('DebugKit')) {
+				DebugTimer::stop('data-copy-after-find');
+			}
+
 			return $results;
 		}
 
@@ -85,20 +108,20 @@ class DataCopyBehavior extends ModelBehavior {
 		unset($queryData['order'][0]);
 
 		if (is_array($queryData['fields'])) {
-			foreach ($queryData['fields'] as &$field) {
+			foreach ($queryData['fields'] as $index => &$field) {
 				$startQuote = isset($Model->getDataSource()->startQuote) ? $Model->getDataSource()->startQuote : null;
 				$endQuote = isset($Model->getDataSource()->endQuote) ? $Model->getDataSource()->endQuote : null;
 				$field = str_replace(array($startQuote, $endQuote), '', $field);
 
 				$field = $this->convertField($Model, $field);
+
+				if ($field === $Model->OriginModel->alias . '.data_copy_modified') {
+					unset($queryData['fields'][$index]);
+				}
 			}
 		}
 
-//		debug($Model->alias);
-//		debug($queryData);
-
 		$originResults = $Model->OriginModel->find('all', $queryData);
-//		debug($originResults);
 
 		foreach ($originResults as $index => &$result) {
 			$result[$Model->alias] = $result[$Model->OriginModel->alias];
@@ -116,6 +139,10 @@ class DataCopyBehavior extends ModelBehavior {
 		}
 
 		foreach ($Model->getAssociated('belongsTo') as $association) {
+			if (!isset($Model->belongsTo[$association]['origin'])) {
+				continue;
+			}
+
 			$origin = $Model->belongsTo[$association]['origin'];
 
 			foreach ($originResults as $index => &$result) {
@@ -130,7 +157,16 @@ class DataCopyBehavior extends ModelBehavior {
 			}
 		}
 
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::start(
+				'data-copy-save-all',
+				__d('data_copy', 'DataCopy: Saving data in %1$s from origin %2$s', $Model->alias, $Model->OriginModel->alias)
+			);
+		}
 		$Model->saveAll($originResults, array('deep' => true));
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::stop('data-copy-save-all');
+		}
 
 		if (!is_array($query['order'][0])) {
 			$query['order'] = array();
@@ -141,16 +177,8 @@ class DataCopyBehavior extends ModelBehavior {
 		$query['copy'] = true;
 		$results = $Model->find('all', $query);
 
-		foreach ($results as $index => $result) {
-			foreach ($result as $association => $data) {
-				foreach ($data as $field => $value) {
-					$unserializedValue = @unserialize($value);
-					if ($unserializedValue === false) {
-						continue;
-					}
-					$results[$index][$association][$field] = $unserializedValue;
-				}
-			}
+		if (CakePlugin::loaded('DebugKit')) {
+			DebugTimer::stop('data-copy-after-find');
 		}
 
 		return $results;
@@ -166,9 +194,6 @@ class DataCopyBehavior extends ModelBehavior {
 		}
 		if ($Model->OriginModel->schema($field)['type'] === 'time') {
 			return date($Model->getDataSource()->columns['time']['format'], strtotime($value));
-		}
-		if ((is_array($value)) || (is_object($value))) {
-			return serialize($value);
 		}
 
 		return $value;
